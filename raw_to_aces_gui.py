@@ -5,7 +5,7 @@
 #   python raw_to_aces_gui.py
 #
 # 「ファイル追加」で画像を選び、「変換開始」でリニアACEScgへ変換する
-# 一覧で選択した画像はプレビュー表示される
+# 追加した画像はサムネイルのグリッドで一覧表示される（クリックで選択）
 # 出力形式は16bit TIFF / 32bit float EXRから選べる
 # 保存先は既定で各画像フォルダ内の convert_aces/、設定で固定フォルダも選べる
 
@@ -37,9 +37,18 @@ COMPRESSION_OPTIONS = (("lzw", "LZW"), ("deflate", "Deflate"), ("none", "圧縮�
 # ファイル選択ダイアログ用のパターン
 RAW_PATTERN = " ".join(f"*{ext}" for ext in RAW_EXTENSIONS)
 
-# プレビュー画像の最大辺(px)とキャッシュ件数
-PREVIEW_MAX = 320
-PREVIEW_CACHE_MAX = 30
+# サムネイルの最大辺(px)と選択枠の色
+THUMB_MAX = 160
+SELECT_COLOR = "#1a73e8"
+
+# 状態ごとの表示色
+STATUS_COLORS = {
+    "待機": "#666666",
+    "変換中": "#1a56db",
+    "完了": "#0f7b3f",
+    "スキップ": "#b45309",
+    "エラー": "#c62828",
+}
 
 
 def _apply_flip(img: np.ndarray, flip: int) -> np.ndarray:
@@ -57,7 +66,7 @@ def _apply_flip(img: np.ndarray, flip: int) -> np.ndarray:
     return img
 
 
-def make_preview_png(path: Path, max_size: int = PREVIEW_MAX) -> bytes:
+def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
     # 埋め込みサムネイルを優先し、無ければ縮小現像してPNGを作る
     with rawpy.imread(str(path)) as raw:
         flip = raw.sizes.flip
@@ -114,10 +123,12 @@ class App:
         self.running = False
         self.reserved: set[Path] = set()
         self.last_out_dir: Path | None = None
-        self.preview_path: Path | None = None
-        self.preview_image: tk.PhotoImage | None = None
-        self.preview_cache: dict[Path, bytes] = {}
-        self.preview_token = 0
+        self.tiles: dict[Path, dict] = {}
+        self.selected: set[Path] = set()
+        self.thumbs: dict[Path, tk.PhotoImage] = {}
+        self.thumb_queue: queue.Queue = queue.Queue()
+        self.thumb_pending: set[Path] = set()
+        self.thumb_cols = 0
 
         # 表示名 -> キー の対応表（スレッドからtk変数を読まないよう開始時に確定させる）
         self.format_map = {label: key for key, label in FORMAT_OPTIONS}
@@ -125,7 +136,7 @@ class App:
         self.comp_map = {label: key for key, label in COMPRESSION_OPTIONS}
 
         root.title("raw → ACEScg 変換 (16bit TIFF / 32bit EXR)")
-        root.minsize(1040, 700)
+        root.minsize(900, 640)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
 
@@ -143,6 +154,8 @@ class App:
         self._build_actions(main)
 
         self._sync_outmode()
+        threading.Thread(target=self._thumb_worker, daemon=True).start()
+        self.root.bind_all("<MouseWheel>", self._on_wheel)
         self.root.after(80, self._poll)
 
     # ---- 画面の組み立て ----
@@ -168,40 +181,140 @@ class App:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
 
-        self.tree = ttk.Treeview(
-            frame,
-            columns=("file", "folder", "status"),
-            show="headings",
-            height=10,
-            selectmode="extended",
-        )
-        self.tree.heading("file", text="ファイル")
-        self.tree.heading("folder", text="フォルダ")
-        self.tree.heading("status", text="状態")
-        self.tree.column("file", width=240, stretch=True, anchor="w")
-        self.tree.column("folder", width=340, stretch=True, anchor="w")
-        self.tree.column("status", width=90, stretch=False, anchor="w")
-        self.tree.grid(row=0, column=0, sticky="nsew")
-
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        # サムネイルのグリッド（スクロール可）
+        self.grid_canvas = tk.Canvas(frame, highlightthickness=0, bg="#fbfbfb")
+        self.grid_canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.grid_canvas.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.grid_canvas.configure(yscrollcommand=scrollbar.set, yscrollincrement=20)
 
-        # 選択した画像のプレビュー
-        preview = ttk.LabelFrame(frame, text="プレビュー", padding=4)
-        preview.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
-        preview.grid_propagate(False)
-        preview.configure(width=PREVIEW_MAX + 20, height=PREVIEW_MAX + 50)
-        preview.columnconfigure(0, weight=1)
-        preview.rowconfigure(0, weight=1)
-
-        self.preview_label = ttk.Label(
-            preview, text="ファイルを選択すると表示します", anchor="center",
+        self.grid_frame = tk.Frame(self.grid_canvas, bg="#fbfbfb")
+        self.grid_window = self.grid_canvas.create_window(
+            (0, 0), window=self.grid_frame, anchor="nw",
         )
-        self.preview_label.grid(row=0, column=0, sticky="nsew")
-        self.preview_info = ttk.Label(preview, text="", anchor="w")
-        self.preview_info.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.grid_frame.bind(
+            "<Configure>",
+            lambda _e: self.grid_canvas.configure(scrollregion=self.grid_canvas.bbox("all")),
+        )
+        self.grid_canvas.bind("<Configure>", self._on_grid_resize)
+
+    # ---- サムネイルグリッド ----
+
+    def _on_grid_resize(self, event) -> None:
+        self.grid_canvas.itemconfigure(self.grid_window, width=event.width)
+        self._relayout_tiles(force=True)
+
+    def _relayout_tiles(self, force: bool = False) -> None:
+        cols = max(1, self.grid_canvas.winfo_width() // (THUMB_MAX + 24))
+        if not force and cols == self.thumb_cols:
+            return
+        self.thumb_cols = cols
+        for i, path in enumerate(self.files):
+            tile = self.tiles.get(path)
+            if tile is not None:
+                tile["outer"].grid(row=i // cols, column=i % cols, padx=5, pady=5)
+
+    def _on_wheel(self, event) -> None:
+        # グリッド上にポインタがある時だけスクロールする
+        widget = self.root.winfo_containing(event.x_root, event.y_root)
+        while widget is not None:
+            if widget is self.grid_canvas or widget is self.grid_frame:
+                self.grid_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                return
+            widget = getattr(widget, "master", None)
+
+    def _add_tile(self, path: Path) -> None:
+        outer = tk.Frame(
+            self.grid_frame, bg="#ffffff", bd=0,
+            highlightthickness=2, highlightbackground="#d9d9d9",
+        )
+        holder = tk.Frame(outer, width=THUMB_MAX, height=THUMB_MAX, bg="#f0f0f0")
+        holder.pack(padx=4, pady=(4, 2))
+        holder.pack_propagate(False)
+
+        image_label = tk.Label(holder, bg="#f0f0f0", text="…", fg="#999999")
+        image_label.place(relx=0.5, rely=0.5, anchor="center")
+
+        name_label = tk.Label(
+            outer, text=path.name, bg="#ffffff", fg="#333333",
+            wraplength=THUMB_MAX, justify="center",
+        )
+        name_label.pack(padx=4, fill="x")
+
+        status_label = tk.Label(
+            outer, text="待機", bg="#ffffff", fg=STATUS_COLORS["待機"],
+        )
+        status_label.pack(padx=4, pady=(0, 4), fill="x")
+
+        for widget in (outer, holder, image_label, name_label, status_label):
+            widget.bind("<Button-1>", lambda _e, p=path: self._on_tile_click(p, _e))
+
+        self.tiles[path] = {
+            "outer": outer,
+            "image": image_label,
+            "name": name_label,
+            "status": status_label,
+        }
+
+        cached = self.thumbs.get(path)
+        if cached is not None:
+            image_label.configure(image=cached, text="")
+        else:
+            self._queue_thumb(path)
+
+    def _queue_thumb(self, path: Path) -> None:
+        if path in self.thumbs or path in self.thumb_pending:
+            return
+        self.thumb_pending.add(path)
+        self.thumb_queue.put(path)
+
+    def _thumb_worker(self) -> None:
+        # サムネイル生成は1本のスレッドで順番に行う
+        while True:
+            path = self.thumb_queue.get()
+            if path is None:
+                return
+            try:
+                data = make_thumbnail_png(path)
+            except Exception as exc:
+                self.queue.put(("thumb_error", path, describe(exc)))
+            else:
+                self.queue.put(("thumb", path, data))
+            self.thumb_pending.discard(path)
+
+    def _apply_thumb(self, path: Path, data: bytes) -> None:
+        tile = self.tiles.get(path)
+        if tile is None:
+            return
+        try:
+            image = tk.PhotoImage(data=data)
+        except tk.TclError:
+            return
+        self.thumbs[path] = image
+        tile["image"].configure(image=image, text="")
+
+    def _set_thumb_error(self, path: Path, message: str) -> None:
+        tile = self.tiles.get(path)
+        if tile is None:
+            return
+        tile["image"].configure(text="画像なし", fg="#999999")
+        tile["image"].image = None
+        self._log(f"プレビュー不可: {path.name}: {message}")
+
+    def _on_tile_click(self, path: Path, event) -> None:
+        if event.state & 0x0004:  # Ctrl押下で追加/解除
+            if path in self.selected:
+                self.selected.discard(path)
+            else:
+                self.selected.add(path)
+        else:
+            self.selected = {path}
+        self._refresh_selection()
+
+    def _refresh_selection(self) -> None:
+        for path, tile in self.tiles.items():
+            color = SELECT_COLOR if path in self.selected else "#d9d9d9"
+            tile["outer"].configure(highlightbackground=color)
 
     def _build_settings(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="設定", padding=8)
@@ -340,14 +453,11 @@ class App:
                 continue
             seen.add(key)
             self.files.append(path)
-
-            # ツリーの行IDにはパス文字列を使う
-            self.tree.insert(
-                "", "end", iid=str(path),
-                values=(path.name, str(path.parent), "待機"),
-            )
+            self._add_tile(path)
             added += 1
 
+        if added:
+            self._relayout_tiles()
         self._update_count()
         if added:
             self._log(f"{added}件を追加しました")
@@ -355,98 +465,38 @@ class App:
     def remove_selected(self) -> None:
         if self.running:
             return
-        for iid in self.tree.selection():
-            self.tree.delete(iid)
-            path = Path(iid)
+        for path in list(self.selected):
+            tile = self.tiles.pop(path, None)
+            if tile is not None:
+                tile["outer"].destroy()
             if path in self.files:
                 self.files.remove(path)
             self.reserved.discard(path)
-            self.preview_cache.pop(path, None)
-        if self.preview_path not in self.files:
-            self._clear_preview()
+            self.thumbs.pop(path, None)
+        self.selected.clear()
+        self._refresh_selection()
+        self._relayout_tiles()
         self._update_count()
 
     def clear_all(self) -> None:
         if self.running:
             return
-        self.tree.delete(*self.tree.get_children())
+        for tile in self.tiles.values():
+            tile["outer"].destroy()
+        self.tiles.clear()
         self.files.clear()
+        self.selected.clear()
+        self.thumbs.clear()
         self.reserved.clear()
-        self.preview_cache.clear()
         self.last_out_dir = None
         self.open_btn.configure(state="disabled")
         self.progress.configure(value=0)
         self.status_label.configure(text="ファイルを追加してください")
-        self._clear_preview()
+        self._relayout_tiles()
         self._update_count()
 
     def _update_count(self) -> None:
         self.count_label.configure(text=f"{len(self.files)}件")
-
-    # ---- プレビュー ----
-
-    def _on_select(self, _event=None) -> None:
-        selection = self.tree.selection()
-        if not selection:
-            return
-        self._request_preview(Path(selection[0]))
-
-    def _request_preview(self, path: Path) -> None:
-        self.preview_path = path
-        cached = self.preview_cache.get(path)
-        if cached is not None:
-            self._show_preview(path, cached)
-            return
-
-        self.preview_token += 1
-        self.preview_image = None
-        self.preview_label.configure(image="", text="読み込み中...")
-        self.preview_info.configure(text=path.name)
-        threading.Thread(
-            target=self._preview_worker,
-            args=(path, self.preview_token),
-            daemon=True,
-        ).start()
-
-    def _preview_worker(self, path: Path, token: int) -> None:
-        try:
-            data = make_preview_png(path)
-        except Exception as exc:
-            self.queue.put(("preview_error", path, describe(exc), token))
-        else:
-            self.queue.put(("preview", path, data, token))
-
-    def _show_preview(self, path: Path, data: bytes, token: int | None = None) -> None:
-        if token is not None and token != self.preview_token:
-            return
-        if path != self.preview_path:
-            return
-        try:
-            image = tk.PhotoImage(data=data)
-        except tk.TclError:
-            return
-        self.preview_image = image
-        self.preview_label.configure(image=image, text="")
-        self.preview_info.configure(
-            text=f"{path.name}  ({image.width()}×{image.height()})"
-        )
-        self.preview_cache[path] = data
-        while len(self.preview_cache) > PREVIEW_CACHE_MAX:
-            self.preview_cache.pop(next(iter(self.preview_cache)))
-
-    def _show_preview_error(self, path: Path, message: str, token: int) -> None:
-        if token != self.preview_token or path != self.preview_path:
-            return
-        self.preview_image = None
-        self.preview_label.configure(image="", text="プレビューを表示できません")
-        self.preview_info.configure(text=message)
-
-    def _clear_preview(self) -> None:
-        self.preview_path = None
-        self.preview_token += 1
-        self.preview_image = None
-        self.preview_label.configure(image="", text="ファイルを選択すると表示します")
-        self.preview_info.configure(text="")
 
     # ---- 設定 ----
 
@@ -580,10 +630,10 @@ class App:
             elif kind == "outdir":
                 self.last_out_dir = Path(message[1])
                 self.open_btn.configure(state="normal")
-            elif kind == "preview":
-                self._show_preview(message[1], message[2], message[3])
-            elif kind == "preview_error":
-                self._show_preview_error(message[1], message[2], message[3])
+            elif kind == "thumb":
+                self._apply_thumb(message[1], message[2])
+            elif kind == "thumb_error":
+                self._set_thumb_error(message[1], message[2])
             elif kind == "done":
                 self._finish(message[1])
 
@@ -641,9 +691,11 @@ class App:
     # ---- 表示の更新 ----
 
     def _set_status(self, path: Path, text: str) -> None:
-        iid = str(path)
-        if self.tree.exists(iid):
-            self.tree.set(iid, "status", text)
+        tile = self.tiles.get(path)
+        if tile is not None:
+            tile["status"].configure(
+                text=text, fg=STATUS_COLORS.get(text, "#333333"),
+            )
 
     def _log(self, text: str) -> None:
         self.log.configure(state="normal")
