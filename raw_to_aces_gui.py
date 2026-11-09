@@ -72,8 +72,10 @@ def _decode_thumb(thumb) -> np.ndarray | None:
     # 埋め込みサムネイル(JPEG/BITMAP)をBGRの8bit画像にする
     if thumb.format == rawpy.ThumbFormat.JPEG:
         # 表示用なので1/2サイズでデコードし、読み込みを軽くする
+        # EXIFの向きは自動適用せず、rawpyのflip値で向きをそろえる
         return cv2.imdecode(
-            np.frombuffer(thumb.data, np.uint8), cv2.IMREAD_REDUCED_COLOR_2,
+            np.frombuffer(thumb.data, np.uint8),
+            cv2.IMREAD_REDUCED_COLOR_2 | cv2.IMREAD_IGNORE_ORIENTATION,
         )
 
     data = thumb.data
@@ -175,27 +177,35 @@ def _bayer_preview_bgr(raw: "rawpy.RawPy", max_size: int = 512) -> np.ndarray | 
     return np.ascontiguousarray(np.rint(bgr * 255.0).astype(np.uint8))
 
 
+def _apply_thumb_flip(img: np.ndarray, flip: int) -> np.ndarray:
+    # 90度回転が必要なとき、すでに縦向きのサムネイルは回転済みとみなす
+    # （EXIFの向きを無視してデコードしているため、二重返転を防ぐ）
+    if flip in (5, 6) and img.shape[1] <= img.shape[0]:
+        return img
+    return _apply_flip(img, flip)
+
+
 def _raw_thumbnail_bgr(path: Path) -> np.ndarray:
     # rawのサムネイルをBGRで返す（埋め込み→縮小現像→ベイヤー簡易表示の順）
     with rawpy.imread(str(path)) as raw:
         flip = raw.sizes.flip
         try:
             img = _decode_thumb(raw.extract_thumb())
-            need_flip = True
+            if img is not None:
+                img = _apply_thumb_flip(img, flip)
         except Exception:
             img = None
-            need_flip = True
 
         if img is None:
             img = _postprocess_bgr(raw)
-            need_flip = False  # 現像側で向きが反映される
         if img is None:
             img = _bayer_preview_bgr(raw)
-            need_flip = True
+            if img is not None:
+                img = _apply_thumb_flip(img, flip)
 
     if img is None:
         raise RuntimeError("rawを読み込めませんでした")
-    return _apply_flip(img, flip) if need_flip else img
+    return img
 
 
 def _image_thumbnail_bgr(path: Path) -> np.ndarray:
