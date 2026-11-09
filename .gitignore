@@ -223,6 +223,10 @@ __marimo__/
 # ビルド定義は残す（上の *.spec 指定を打ち消す）
 !RawToAces.spec
 
-# 動作確認用の一時フォルダ
+# 変換結果の出力フォルダ
+convert_aces/
+
+# 動作確認用の一時フォルダ・ログ
 _tmp*/
+_build*.log
 
