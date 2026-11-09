@@ -161,6 +161,8 @@ def _decode_image_to_acescg(path: Path) -> np.ndarray:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
     if img.dtype not in (np.uint8, np.uint16):
+        if img.dtype in (np.float32, np.float64):
+            raise RuntimeError("float画像（EXRなど）は入力に未対応です")
         raise RuntimeError("未対応の画像形式です（8bit / 16bit画像に対応）")
 
     # sRGB逆ガンマ（LUT）→ リニアsRGB(BGR) → ACEScg
@@ -180,7 +182,10 @@ def decode_to_acescg(path: Path) -> np.ndarray:
     except Exception as raw_exc:
         try:
             return _decode_image_to_acescg(path)
-        except Exception:
+        except Exception as img_exc:
+            # 拡張子が画像寄りなら画像側のエラーを優先して返す
+            if path.suffix.lower() in IMAGE_EXTENSIONS or path.suffix.lower() == ".exr":
+                raise img_exc
             raise raw_exc
 
 
@@ -325,6 +330,7 @@ def _srgb_encode(x: np.ndarray) -> np.ndarray:
 
 def _postprocess_bgr(raw: "rawpy.RawPy") -> np.ndarray | None:
     # 現像できればBGR画像を返す（高速設定→既定設定の順で試す）
+    # 向きはrawのflip値を明示してLibRawの既定値に依存しないようにする
     attempts = (
         {"half_size": True, "demosaic_algorithm": rawpy.DemosaicAlgorithm.LINEAR},
         {"half_size": True},
@@ -336,6 +342,7 @@ def _postprocess_bgr(raw: "rawpy.RawPy") -> np.ndarray | None:
                 use_camera_wb=True,
                 no_auto_bright=True,
                 output_bps=8,
+                user_flip=raw.sizes.flip,
                 **extra,
             )
         except Exception:
@@ -387,18 +394,38 @@ def _bayer_preview_bgr(raw: "rawpy.RawPy", max_size: int = 512) -> np.ndarray | 
     th = max(1, int(h2 * scale))
 
     chans: dict[str, np.ndarray] = {}
-    for name, ids, mult in (
-        ("r", (0,), wb[0]),
-        ("g", (1, 3), (wb[1] + wb[3]) / 2.0),
-        ("b", (2,), wb[2]),
-    ):
+
+    def _channel(ids: tuple[int, ...]) -> np.ndarray | None:
         ps = [p for i in ids for p in planes.get(i, [])]
         if not ps:
             return None
         acc = ps[0].astype(np.float32)
         for p in ps[1:]:
             acc += p
+        return acc / len(ps)
+
+    r = _channel((0,))
+    g = _channel((1, 3))
+    b = _channel((2,))
+
+    if r is None or g is None or b is None:
+        # 非ベイヤー配列（X-Transなど）はグレースケールで表示する
+        ps = [p for group in planes.values() for p in group]
+        acc = ps[0].astype(np.float32)
+        for p in ps[1:]:
+            acc += p
         acc /= len(ps) * white
+        np.clip(acc, 0.0, 1.0, out=acc)
+        gray = _srgb_encode(cv2.resize(acc, (tw, th), interpolation=cv2.INTER_AREA))
+        gray8 = np.rint(gray * 255.0).astype(np.uint8)
+        return np.ascontiguousarray(np.stack([gray8, gray8, gray8], axis=-1))
+
+    for name, plane, mult in (
+        ("r", r, wb[0]),
+        ("g", g, (wb[1] + wb[3]) / 2.0),
+        ("b", b, wb[2]),
+    ):
+        acc = plane / white
         acc *= mult
         np.clip(acc, 0.0, 1.0, out=acc)
         small = cv2.resize(acc, (tw, th), interpolation=cv2.INTER_AREA)
@@ -411,6 +438,7 @@ def _bayer_preview_bgr(raw: "rawpy.RawPy", max_size: int = 512) -> np.ndarray | 
 def _apply_thumb_flip(img: np.ndarray, flip: int) -> np.ndarray:
     # 90度回転が必要なとき、すでに縦向きのサムネイルは回転済みとみなす
     # （EXIFの向きを無視してデコードしているため、二重返転を防ぐ）
+    # 前提: 横位置センサー機で、縦位置の最終画像は縦向きになる
     if flip in (5, 6) and img.shape[1] <= img.shape[0]:
         return img
     return _apply_flip(img, flip)
@@ -446,6 +474,11 @@ def _image_thumbnail_bgr(path: Path) -> np.ndarray:
         img = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if img is None:
         raise RuntimeError(f"画像を読み込めません: {path.name}")
+    if img.dtype in (np.float32, np.float64):
+        # EXRなどfloat画像は表示用にsRGB化する
+        data = np.clip(img.astype(np.float32), 0.0, 1.0)
+        data = _srgb_encode(data)
+        img = np.rint(data * 255.0).astype(np.uint8)
     return img
 
 
@@ -453,8 +486,12 @@ def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
     # rawは埋め込みサムネイルを優先し、raw以外は画像として読み込む
     try:
         img = _raw_thumbnail_bgr(path)
-    except Exception:
-        img = _image_thumbnail_bgr(path)
+    except Exception as raw_exc:
+        try:
+            img = _image_thumbnail_bgr(path)
+        except Exception as img_exc:
+            # 両方の失敗理由を残して原因を追いやすくする
+            raise RuntimeError(f"{describe(raw_exc)} / {describe(img_exc)}")
     img = np.ascontiguousarray(img)
 
     h, w = img.shape[:2]
@@ -607,7 +644,7 @@ class App:
 
         name_label = tk.Label(
             outer, text=path.name, bg="#ffffff", fg="#333333",
-            wraplength=THUMB_MAX, justify="center",
+            wraplength=THUMB_MAX, justify="center", height=2,
         )
         name_label.pack(padx=4, fill="x")
 
@@ -639,7 +676,7 @@ class App:
         self.thumb_queue.put(path)
 
     def _thumb_worker(self) -> None:
-        # サムネイル生成は1本のスレッドで順番に行う
+        # サムネイル生成は2本のスレッドで並行に行う
         while True:
             path = self.thumb_queue.get()
             if path is None:
@@ -668,7 +705,6 @@ class App:
         if tile is None:
             return
         tile["image"].configure(text="画像なし", fg="#999999")
-        tile["image"].image = None
         self._log(f"プレビュー不可: {path.name}: {message}")
 
     def _on_tile_click(self, path: Path, event) -> None:
@@ -694,7 +730,7 @@ class App:
         ttk.Label(box, text="出力形式").grid(row=0, column=0, sticky="w")
         self.format_var = tk.StringVar(value=FORMAT_LABELS["exr"])
         self.format_combo = ttk.Combobox(
-            box, textvariable=self.format_var, state="readonly", width=18,
+            box, textvariable=self.format_var, state="readonly", width=21,
             values=[label for _, label in FORMAT_OPTIONS],
         )
         self.format_combo.grid(row=0, column=1, sticky="w", padx=(6, 18))
@@ -1072,6 +1108,10 @@ class App:
     def _log(self, text: str) -> None:
         self.log.configure(state="normal")
         self.log.insert("end", text + "\n")
+        # 行数が増えすぎないよう古い行を削る
+        lines = int(self.log.index("end-1c").split(".")[0])
+        if lines > 1000:
+            self.log.delete("1.0", f"{lines - 1000}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
 

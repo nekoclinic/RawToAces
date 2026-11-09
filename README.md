@@ -3,7 +3,8 @@
 raw画像を選択して、ACEScg（リニア）へ変換するGUIツール。
 
 - 入力: raw（DNG / CR3 / NEF など LibRaw対応形式）と通常画像（JPEG / PNG / TIFF / BMP / WebP）
-  - 通常画像は sRGB としてリニア化し、ACEScg へ変換します
+  - 通常画像は sRGB としてリニア化し、ACEScg へ変換します（16bit TIFF も sRGB 前提）
+  - EXRなどのfloat画像は入力に未対応です
 - 出力形式: 16bit TIFF / 32bit float EXR
 
 ## セットアップ
@@ -11,6 +12,8 @@ raw画像を選択して、ACEScg（リニア）へ変換するGUIツール。
 ```bash
 pip install -r requirements.txt
 ```
+
+EXRの色域情報（ACEScg）付与に OpenEXR を使用します。
 
 ## 使い方
 
@@ -32,9 +35,9 @@ python raw_to_aces_gui.py
 | --- | --- |
 | 出力形式 | `OpenEXR (32bit float)`（既定） / `TIFF (16bit)` |
 | EXR圧縮 | PXR24（既定・軽量） / DWAA（最小・非可逆） / ZIP（可逆） |
-| TIFF圧縮 | LZW / Deflate / 圧縮なし（EXRはZIP固定） |
+| TIFF圧縮 | LZW / Deflate / 圧縮なし |
 | 保存先 | 各画像のフォルダ内の `convert_aces/`、または指定フォルダ |
-| 出力済みファイルはスキップ | 同名ファイルがある場合にスキップ（オフなら連番で保存） |
+| 出力済みファイルはスキップ | 同名ファイルがある場合にスキップ（オフなら連番で保存。同じ実行内で作成した出力もスキップ対象） |
 
 ## 出力
 
@@ -78,3 +81,5 @@ python -m PyInstaller --noconfirm --clean RawToAces.spec
 - リニアACEScgのため、そのままビューアで開くと暗く見えるのが正常です。
   表示確認は After Effects / DaVinci Resolve / OCIO 対応アプリなどで行ってください。
 - ハイライトは LibRaw のクリップ処理により白レベルで頭打ちになります。
+- 大きな画像（40MP超など）では変換時に数百MB〜1GB程度のメモリを使います。
+  メモリ不足になる場合は TIFF（16bit）出力にすると負荷を抑えられます。

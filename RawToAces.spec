@@ -3,7 +3,7 @@ import os
 
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('icon.ico', '.')]
+datas = [(os.path.join(SPECPATH, 'icon.ico'), '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('rawpy')
