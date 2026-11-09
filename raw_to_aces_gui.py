@@ -69,7 +69,10 @@ def _apply_flip(img: np.ndarray, flip: int) -> np.ndarray:
 def _decode_thumb(thumb) -> np.ndarray | None:
     # 埋め込みサムネイル(JPEG/BITMAP)をBGRの8bit画像にする
     if thumb.format == rawpy.ThumbFormat.JPEG:
-        return cv2.imdecode(np.frombuffer(thumb.data, np.uint8), cv2.IMREAD_COLOR)
+        # 表示用なので1/2サイズでデコードし、読み込みを軽くする
+        return cv2.imdecode(
+            np.frombuffer(thumb.data, np.uint8), cv2.IMREAD_REDUCED_COLOR_2,
+        )
 
     data = thumb.data
     if data.ndim == 2:
@@ -92,8 +95,10 @@ def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
             img = None
 
         if img is None:
+            # サムネイルが使えない場合の最低限の現像（高速設定）
             rgb = raw.postprocess(
                 half_size=True,
+                demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR,
                 use_camera_wb=True,
                 no_auto_bright=True,
                 output_bps=8,
