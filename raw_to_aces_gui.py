@@ -66,13 +66,32 @@ def _apply_flip(img: np.ndarray, flip: int) -> np.ndarray:
     return img
 
 
+def _decode_thumb(thumb) -> np.ndarray | None:
+    # 埋め込みサムネイル(JPEG/BITMAP)をBGRの8bit画像にする
+    if thumb.format == rawpy.ThumbFormat.JPEG:
+        return cv2.imdecode(np.frombuffer(thumb.data, np.uint8), cv2.IMREAD_COLOR)
+
+    data = thumb.data
+    if data.ndim == 2:
+        return cv2.cvtColor(data, cv2.COLOR_GRAY2BGR)
+    if data.shape[2] == 4:
+        return cv2.cvtColor(data, cv2.COLOR_RGBA2BGR)
+    if data.shape[2] == 3:
+        return np.ascontiguousarray(data[:, :, ::-1])
+    return None
+
+
 def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
-    # 埋め込みサムネイルを優先し、無ければ縮小現像してPNGを作る
+    # 埋め込みサムネイルを優先し、使えなければ縮小現像してPNGを作る
     with rawpy.imread(str(path)) as raw:
         flip = raw.sizes.flip
         try:
-            thumb = raw.extract_thumb()
-        except rawpy.LibRawNoThumbnailError:
+            img = _decode_thumb(raw.extract_thumb())
+        except Exception:
+            # サムネイルが無い/未対応の形式は縮小現像にフォールバック
+            img = None
+
+        if img is None:
             rgb = raw.postprocess(
                 half_size=True,
                 use_camera_wb=True,
@@ -80,11 +99,7 @@ def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
                 output_bps=8,
             )
             img = np.ascontiguousarray(rgb[:, :, ::-1])
-        else:
-            if thumb.format == rawpy.ThumbFormat.JPEG:
-                img = cv2.imdecode(np.frombuffer(thumb.data, np.uint8), cv2.IMREAD_COLOR)
-            else:
-                img = np.ascontiguousarray(thumb.data[:, :, ::-1])
+            flip = 0  # 現像側で向きが反映されるため再適用しない
 
     if img is None:
         raise RuntimeError("プレビューを読み込めません")
@@ -154,7 +169,8 @@ class App:
         self._build_actions(main)
 
         self._sync_outmode()
-        threading.Thread(target=self._thumb_worker, daemon=True).start()
+        for _ in range(2):
+            threading.Thread(target=self._thumb_worker, daemon=True).start()
         self.root.bind_all("<MouseWheel>", self._on_wheel)
         self.root.after(80, self._poll)
 
@@ -232,7 +248,7 @@ class App:
         holder.pack(padx=4, pady=(4, 2))
         holder.pack_propagate(False)
 
-        image_label = tk.Label(holder, bg="#f0f0f0", text="…", fg="#999999")
+        image_label = tk.Label(holder, bg="#f0f0f0", text="読込中", fg="#999999")
         image_label.place(relx=0.5, rely=0.5, anchor="center")
 
         name_label = tk.Label(
@@ -619,25 +635,31 @@ class App:
                 message = self.queue.get_nowait()
             except queue.Empty:
                 break
-
-            kind = message[0]
-            if kind == "status":
-                self._set_status(Path(message[1]), message[2])
-            elif kind == "log":
-                self._log(message[1])
-            elif kind == "progress":
-                self.progress.configure(value=message[1])
-            elif kind == "outdir":
-                self.last_out_dir = Path(message[1])
-                self.open_btn.configure(state="normal")
-            elif kind == "thumb":
-                self._apply_thumb(message[1], message[2])
-            elif kind == "thumb_error":
-                self._set_thumb_error(message[1], message[2])
-            elif kind == "done":
-                self._finish(message[1])
+            try:
+                self._handle_message(message)
+            except Exception as exc:
+                # 1件の失敗でポーリングを止めない
+                self._log(f"内部エラー: {describe(exc)}")
 
         self.root.after(80, self._poll)
+
+    def _handle_message(self, message) -> None:
+        kind = message[0]
+        if kind == "status":
+            self._set_status(Path(message[1]), message[2])
+        elif kind == "log":
+            self._log(message[1])
+        elif kind == "progress":
+            self.progress.configure(value=message[1])
+        elif kind == "outdir":
+            self.last_out_dir = Path(message[1])
+            self.open_btn.configure(state="normal")
+        elif kind == "thumb":
+            self._apply_thumb(message[1], message[2])
+        elif kind == "thumb_error":
+            self._set_thumb_error(message[1], message[2])
+        elif kind == "done":
+            self._finish(message[1])
 
     def _finish(self, counts: dict[str, int]) -> None:
         self.running = False
