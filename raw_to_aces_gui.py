@@ -270,6 +270,12 @@ class App:
         self.comp_map = {label: key for key, label in COMPRESSION_OPTIONS}
 
         root.title("raw → ACEScg 変換 (16bit TIFF / 32bit EXR)")
+        # タイトルバー/タスクバーのアイコンを表示しない（透明画像を設定）
+        try:
+            self._blank_icon = tk.PhotoImage(width=1, height=1)
+            root.iconphoto(True, self._blank_icon)
+        except Exception:
+            pass
         root.minsize(900, 640)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
