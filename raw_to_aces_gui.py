@@ -5,6 +5,7 @@
 #   python raw_to_aces_gui.py
 #
 # 「ファイル追加」で画像を選び、「変換開始」でリニアACEScgへ変換する
+# 一覧で選択した画像はプレビュー表示される
 # 出力形式は16bit TIFF / 32bit float EXRから選べる
 # 保存先は既定で各画像フォルダ内の convert_aces/、設定で固定フォルダも選べる
 
@@ -19,6 +20,13 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+# OpenCVのEXRコーデックは既定で無効なので、読み込む前に有効化する
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+
+import cv2
+import numpy as np
+import rawpy
+
 from raw_to_aces import FORMAT_LABELS, OUTPUT_DIR_NAME, RAW_EXTENSIONS, convert_file, describe
 
 # 選択肢（キー, 表示名）
@@ -28,6 +36,63 @@ COMPRESSION_OPTIONS = (("lzw", "LZW"), ("deflate", "Deflate"), ("none", "圧縮�
 
 # ファイル選択ダイアログ用のパターン
 RAW_PATTERN = " ".join(f"*{ext}" for ext in RAW_EXTENSIONS)
+
+# プレビュー画像の最大辺(px)とキャッシュ件数
+PREVIEW_MAX = 320
+PREVIEW_CACHE_MAX = 30
+
+
+def _apply_flip(img: np.ndarray, flip: int) -> np.ndarray:
+    # LibRawのorientation値に合わせて向きを整える
+    if flip == 3:
+        return cv2.rotate(img, cv2.ROTATE_180)
+    if flip == 5:
+        return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if flip == 6:
+        return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+    if flip == 1:
+        return cv2.flip(img, 1)
+    if flip == 2:
+        return cv2.flip(img, 0)
+    return img
+
+
+def make_preview_png(path: Path, max_size: int = PREVIEW_MAX) -> bytes:
+    # 埋め込みサムネイルを優先し、無ければ縮小現像してPNGを作る
+    with rawpy.imread(str(path)) as raw:
+        flip = raw.sizes.flip
+        try:
+            thumb = raw.extract_thumb()
+        except rawpy.LibRawNoThumbnailError:
+            rgb = raw.postprocess(
+                half_size=True,
+                use_camera_wb=True,
+                no_auto_bright=True,
+                output_bps=8,
+            )
+            img = np.ascontiguousarray(rgb[:, :, ::-1])
+        else:
+            if thumb.format == rawpy.ThumbFormat.JPEG:
+                img = cv2.imdecode(np.frombuffer(thumb.data, np.uint8), cv2.IMREAD_COLOR)
+            else:
+                img = np.ascontiguousarray(thumb.data[:, :, ::-1])
+
+    if img is None:
+        raise RuntimeError("プレビューを読み込めません")
+    img = np.ascontiguousarray(_apply_flip(img, flip))
+
+    h, w = img.shape[:2]
+    scale = min(max_size / max(w, 1), max_size / max(h, 1), 1.0)
+    if scale < 1.0:
+        img = cv2.resize(
+            img, (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise RuntimeError("プレビュー画像の生成に失敗しました")
+    return buf.tobytes()
 
 
 def enable_dpi_awareness() -> None:
@@ -49,6 +114,10 @@ class App:
         self.running = False
         self.reserved: set[Path] = set()
         self.last_out_dir: Path | None = None
+        self.preview_path: Path | None = None
+        self.preview_image: tk.PhotoImage | None = None
+        self.preview_cache: dict[Path, bytes] = {}
+        self.preview_token = 0
 
         # 表示名 -> キー の対応表（スレッドからtk変数を読まないよう開始時に確定させる）
         self.format_map = {label: key for key, label in FORMAT_OPTIONS}
@@ -56,7 +125,7 @@ class App:
         self.comp_map = {label: key for key, label in COMPRESSION_OPTIONS}
 
         root.title("raw → ACEScg 変換 (16bit TIFF / 32bit EXR)")
-        root.minsize(860, 660)
+        root.minsize(1040, 700)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
 
@@ -109,14 +178,30 @@ class App:
         self.tree.heading("file", text="ファイル")
         self.tree.heading("folder", text="フォルダ")
         self.tree.heading("status", text="状態")
-        self.tree.column("file", width=280, stretch=True, anchor="w")
-        self.tree.column("folder", width=420, stretch=True, anchor="w")
+        self.tree.column("file", width=240, stretch=True, anchor="w")
+        self.tree.column("folder", width=340, stretch=True, anchor="w")
         self.tree.column("status", width=90, stretch=False, anchor="w")
         self.tree.grid(row=0, column=0, sticky="nsew")
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        # 選択した画像のプレビュー
+        preview = ttk.LabelFrame(frame, text="プレビュー", padding=4)
+        preview.grid(row=0, column=2, sticky="nsew", padx=(8, 0))
+        preview.grid_propagate(False)
+        preview.configure(width=PREVIEW_MAX + 20, height=PREVIEW_MAX + 50)
+        preview.columnconfigure(0, weight=1)
+        preview.rowconfigure(0, weight=1)
+
+        self.preview_label = ttk.Label(
+            preview, text="ファイルを選択すると表示します", anchor="center",
+        )
+        self.preview_label.grid(row=0, column=0, sticky="nsew")
+        self.preview_info = ttk.Label(preview, text="", anchor="w")
+        self.preview_info.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
     def _build_settings(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="設定", padding=8)
@@ -276,6 +361,9 @@ class App:
             if path in self.files:
                 self.files.remove(path)
             self.reserved.discard(path)
+            self.preview_cache.pop(path, None)
+        if self.preview_path not in self.files:
+            self._clear_preview()
         self._update_count()
 
     def clear_all(self) -> None:
@@ -284,14 +372,81 @@ class App:
         self.tree.delete(*self.tree.get_children())
         self.files.clear()
         self.reserved.clear()
+        self.preview_cache.clear()
         self.last_out_dir = None
         self.open_btn.configure(state="disabled")
         self.progress.configure(value=0)
         self.status_label.configure(text="ファイルを追加してください")
+        self._clear_preview()
         self._update_count()
 
     def _update_count(self) -> None:
         self.count_label.configure(text=f"{len(self.files)}件")
+
+    # ---- プレビュー ----
+
+    def _on_select(self, _event=None) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        self._request_preview(Path(selection[0]))
+
+    def _request_preview(self, path: Path) -> None:
+        self.preview_path = path
+        cached = self.preview_cache.get(path)
+        if cached is not None:
+            self._show_preview(path, cached)
+            return
+
+        self.preview_token += 1
+        self.preview_image = None
+        self.preview_label.configure(image="", text="読み込み中...")
+        self.preview_info.configure(text=path.name)
+        threading.Thread(
+            target=self._preview_worker,
+            args=(path, self.preview_token),
+            daemon=True,
+        ).start()
+
+    def _preview_worker(self, path: Path, token: int) -> None:
+        try:
+            data = make_preview_png(path)
+        except Exception as exc:
+            self.queue.put(("preview_error", path, describe(exc), token))
+        else:
+            self.queue.put(("preview", path, data, token))
+
+    def _show_preview(self, path: Path, data: bytes, token: int | None = None) -> None:
+        if token is not None and token != self.preview_token:
+            return
+        if path != self.preview_path:
+            return
+        try:
+            image = tk.PhotoImage(data=data)
+        except tk.TclError:
+            return
+        self.preview_image = image
+        self.preview_label.configure(image=image, text="")
+        self.preview_info.configure(
+            text=f"{path.name}  ({image.width()}×{image.height()})"
+        )
+        self.preview_cache[path] = data
+        while len(self.preview_cache) > PREVIEW_CACHE_MAX:
+            self.preview_cache.pop(next(iter(self.preview_cache)))
+
+    def _show_preview_error(self, path: Path, message: str, token: int) -> None:
+        if token != self.preview_token or path != self.preview_path:
+            return
+        self.preview_image = None
+        self.preview_label.configure(image="", text="プレビューを表示できません")
+        self.preview_info.configure(text=message)
+
+    def _clear_preview(self) -> None:
+        self.preview_path = None
+        self.preview_token += 1
+        self.preview_image = None
+        self.preview_label.configure(image="", text="ファイルを選択すると表示します")
+        self.preview_info.configure(text="")
 
     # ---- 設定 ----
 
@@ -425,6 +580,10 @@ class App:
             elif kind == "outdir":
                 self.last_out_dir = Path(message[1])
                 self.open_btn.configure(state="normal")
+            elif kind == "preview":
+                self._show_preview(message[1], message[2], message[3])
+            elif kind == "preview_error":
+                self._show_preview_error(message[1], message[2], message[3])
             elif kind == "done":
                 self._finish(message[1])
 

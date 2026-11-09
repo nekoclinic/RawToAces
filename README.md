@@ -46,6 +46,14 @@ python raw_to_aces.py --format exr IMG_0001.CR3
 - EXR: 32bit float / 3ch / リニア、ZIP圧縮、値はクリップしない
   （AP0→AP1変換で1を超える値や負値はそのまま保持）
 
+## GUI
+
+```bash
+python raw_to_aces_gui.py
+```
+
+一覧で選択した画像をプレビュー表示し、選んだ形式でまとめて変換します。
+
 ## exeのビルド（Windows）
 
 ```bash
