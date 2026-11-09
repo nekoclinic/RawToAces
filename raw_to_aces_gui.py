@@ -70,10 +70,53 @@ SRGB_TO_AP1 = np.array([
 # OpenCVのTIFF圧縮指定値
 COMPRESSION = {"lzw": 5, "deflate": 8, "none": 1}
 
+# EXR圧縮（キー -> OpenEXR / OpenCVの値）
+EXR_COMPRESSION_OPTIONS = (
+    ("pxr24", "PXR24 (軽量)"),
+    ("dwaa", "DWAA (最小・非可逆)"),
+    ("zip", "ZIP (可逆)"),
+)
+
 # ACEScg (AP1) のchromaticities（red, green, blue, white）
 AP1_CHROMATICITIES = (
     0.713, 0.293, 0.165, 0.830, 0.128, 0.044, 0.32168, 0.33767,
 )
+
+# リニアsRGB(BGR) -> ACEScg の変換行列（チャンネル反転も含む）
+BGR_TO_AP1 = (SRGB_TO_AP1 @ np.array([
+    [0.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0],
+    [1.0, 0.0, 0.0],
+], dtype=np.float32)).astype(np.float32)
+
+# sRGB逆ガンマのLUT（8bit / 16bit）
+_SRGB_LUT: dict[str, np.ndarray] = {}
+
+
+def _srgb_lut(dtype) -> np.ndarray:
+    key = np.dtype(dtype).name
+    lut = _SRGB_LUT.get(key)
+    if lut is None:
+        n = 256 if key == "uint8" else 65536
+        x = np.arange(n, dtype=np.float32) / (n - 1)
+        lut = np.where(
+            x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4,
+        ).astype(np.float32)
+        _SRGB_LUT[key] = lut
+    return lut
+
+
+def _apply_matrix_strips(img: np.ndarray, matrix: np.ndarray, scale: float = 1.0) -> np.ndarray:
+    # 画像を縮小しながら行列変換し、メモリ使用量を抑える
+    h, w = img.shape[:2]
+    out = np.empty((h, w, 3), dtype=np.float32)
+    rows = max(1, (64 * 1024 * 1024) // max(1, w * 3 * 4))
+    for y in range(0, h, rows):
+        chunk = img[y:y + rows].astype(np.float32)
+        if scale != 1.0:
+            chunk *= scale
+        out[y:y + rows] = cv2.transform(chunk, matrix)
+    return out
 
 # 選択肢（キー, 表示名）
 FORMAT_OPTIONS = (("tif", FORMAT_LABELS["tif"]), ("exr", FORMAT_LABELS["exr"]))
@@ -102,11 +145,8 @@ def _decode_raw_to_acescg(path: Path) -> np.ndarray:
             use_camera_wb=True,    # 撮影時のホワイトバランス
         )
 
-    # 0..1のリニア値に正規化
-    arr = rgb.astype(np.float32) / 65535.0
-
-    # ACES2065-1 (AP0) -> ACEScg (AP1)
-    return arr @ AP0_TO_AP1.T
+    # 0..1に正規化しつつ ACES2065-1 (AP0) -> ACEScg (AP1)
+    return _apply_matrix_strips(rgb, AP0_TO_AP1, scale=1.0 / 65535.0)
 
 
 def _decode_image_to_acescg(path: Path) -> np.ndarray:
@@ -120,20 +160,17 @@ def _decode_image_to_acescg(path: Path) -> np.ndarray:
     elif img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-    if img.dtype == np.uint8:
-        arr = img.astype(np.float32) / 255.0
-    elif img.dtype == np.uint16:
-        arr = img.astype(np.float32) / 65535.0
-    else:
+    if img.dtype not in (np.uint8, np.uint16):
         raise RuntimeError("未対応の画像形式です（8bit / 16bit画像に対応）")
 
-    # sRGBの逆ガンマでリニアに戻す
-    linear = np.where(
-        arr <= 0.04045, arr / 12.92, ((arr + 0.055) / 1.055) ** 2.4,
-    )
-
-    # リニアsRGB (BGR -> RGB) -> ACEScg
-    return np.ascontiguousarray(linear[:, :, ::-1] @ SRGB_TO_AP1.T, dtype=np.float32)
+    # sRGB逆ガンマ（LUT）→ リニアsRGB(BGR) → ACEScg
+    lut = _srgb_lut(img.dtype)
+    h, w = img.shape[:2]
+    out = np.empty((h, w, 3), dtype=np.float32)
+    rows = max(1, (64 * 1024 * 1024) // max(1, w * 3 * 4))
+    for y in range(0, h, rows):
+        out[y:y + rows] = cv2.transform(lut[img[y:y + rows]], BGR_TO_AP1)
+    return out
 
 
 def decode_to_acescg(path: Path) -> np.ndarray:
@@ -148,34 +185,48 @@ def decode_to_acescg(path: Path) -> np.ndarray:
 
 
 def write_tiff16(rgb: np.ndarray, path: Path, compression: str) -> None:
-    # 16bit RGB TIFFとして保存する（0..1にクリップ）
-    arr = np.rint(np.clip(rgb, 0.0, 1.0) * 65535.0).astype(np.uint16)
+    # 16bit RGB TIFFとして保存する（0..1にクリップ、BGRで書き込む）
+    h, w = rgb.shape[:2]
+    arr = np.empty((h, w, 3), dtype=np.uint16)
+    rows = max(1, (64 * 1024 * 1024) // max(1, w * 3 * 2))
+    for y in range(0, h, rows):
+        chunk = np.rint(np.clip(rgb[y:y + rows], 0.0, 1.0) * 65535.0).astype(np.uint16)
+        arr[y:y + rows] = chunk[:, :, ::-1]
+
     params = [cv2.IMWRITE_TIFF_COMPRESSION, COMPRESSION[compression]]
-    # OpenCVはBGR順として扱うため、書き込み時にチャンネルを反転する
-    out = np.ascontiguousarray(arr[:, :, ::-1])
-    if not cv2.imwrite(str(path), out, params):
+    if not cv2.imwrite(str(path), arr, params):
         raise RuntimeError(f"TIFFの書き込みに失敗しました: {path}")
 
 
-def write_exr32(rgb: np.ndarray, path: Path) -> None:
-    # 32bit float RGB EXRとして保存する（ZIP圧縮、値はクリップしない）
+def write_exr32(rgb: np.ndarray, path: Path, compression: str = "pxr24") -> None:
+    # 32bit float RGB EXRとして保存する（値はクリップしない）
     data = np.ascontiguousarray(rgb, dtype=np.float32)
     if OpenEXR is not None:
+        exr_comp = {
+            "zip": OpenEXR.ZIP_COMPRESSION,
+            "pxr24": OpenEXR.PXR24_COMPRESSION,
+            "dwaa": OpenEXR.DWAA_COMPRESSION,
+        }.get(compression, OpenEXR.PXR24_COMPRESSION)
         # R,G,Bの名前付きチャンネル + ACEScgのchromaticitiesで保存する
         channels = {
             name: OpenEXR.Channel(np.ascontiguousarray(data[:, :, i]))
             for i, name in enumerate("RGB")
         }
         header = {
-            "compression": OpenEXR.ZIP_COMPRESSION,
+            "compression": exr_comp,
             "chromaticities": AP1_CHROMATICITIES,
         }
         OpenEXR.File(header, channels).write(str(path))
         return
 
+    comp_cv = {
+        "zip": cv2.IMWRITE_EXR_COMPRESSION_ZIP,
+        "pxr24": cv2.IMWRITE_EXR_COMPRESSION_PXR24,
+        "dwaa": cv2.IMWRITE_EXR_COMPRESSION_DWAA,
+    }.get(compression, cv2.IMWRITE_EXR_COMPRESSION_PXR24)
     params = [
         cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT,
-        cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_ZIP,
+        cv2.IMWRITE_EXR_COMPRESSION, comp_cv,
     ]
     out = np.ascontiguousarray(data[:, :, ::-1])
     if not cv2.imwrite(str(path), out, params):
@@ -186,6 +237,7 @@ def convert_file(
     path: Path,
     fmt: str = "tif",
     compress: str = "lzw",
+    exr_compression: str = "pxr24",
     out_dir: Path | None = None,
     skip_existing: bool = False,
     reserved: set[Path] | None = None,
@@ -209,7 +261,7 @@ def convert_file(
 
     rgb = decode_to_acescg(path)
     if fmt == "exr":
-        write_exr32(rgb, out_path)
+        write_exr32(rgb, out_path, exr_compression)
     else:
         write_tiff16(rgb, out_path, compress)
 
@@ -447,6 +499,7 @@ class App:
         # 表示名 -> キー の対応表（スレッドからtk変数を読まないよう開始時に確定させる）
         self.format_map = {label: key for key, label in FORMAT_OPTIONS}
         self.comp_map = {label: key for key, label in COMPRESSION_OPTIONS}
+        self.exr_map = {label: key for key, label in EXR_COMPRESSION_OPTIONS}
 
         root.title("raw → ACEScg 変換 (16bit TIFF / 32bit EXR)")
         # ウィンドウ/タスクバーのアイコン（exeと同じアイコン）
@@ -653,7 +706,15 @@ class App:
             box, textvariable=self.comp_var, state="readonly", width=12,
             values=[label for _, label in COMPRESSION_OPTIONS],
         )
-        self.comp_combo.grid(row=0, column=3, sticky="w", padx=(6, 0))
+        self.comp_combo.grid(row=0, column=3, sticky="w", padx=(6, 18))
+
+        ttk.Label(box, text="EXR圧縮").grid(row=0, column=4, sticky="w")
+        self.exr_var = tk.StringVar(value=EXR_COMPRESSION_OPTIONS[0][1])
+        self.exr_combo = ttk.Combobox(
+            box, textvariable=self.exr_var, state="readonly", width=18,
+            values=[label for _, label in EXR_COMPRESSION_OPTIONS],
+        )
+        self.exr_combo.grid(row=0, column=5, sticky="w", padx=(6, 0))
 
         # 保存先の選択
         self.outmode_var = tk.StringVar(value="same")
@@ -689,7 +750,7 @@ class App:
         self.skip_check.grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         ttk.Label(
-            box, text="EXR: 32bit float / ZIP圧縮・値はクリップなし",
+            box, text="EXR: 32bit float / ACEScg色域付き・値はクリップなし",
             foreground="gray",
         ).grid(row=2, column=3, columnspan=3, sticky="w", pady=(10, 0))
 
@@ -807,9 +868,14 @@ class App:
         self.browse_btn.configure(state=state)
 
     def _sync_format(self) -> None:
-        # 圧縮設定はTIFFのときだけ有効にする
-        enabled = self.format_var.get() == FORMAT_LABELS["tif"] and not self.running
-        self.comp_combo.configure(state="readonly" if enabled else "disabled")
+        if self.running:
+            self.comp_combo.configure(state="disabled")
+            self.exr_combo.configure(state="disabled")
+            return
+        # 圧縮設定は選択した形式のものだけ有効にする
+        is_tif = self.format_var.get() == FORMAT_LABELS["tif"]
+        self.comp_combo.configure(state="readonly" if is_tif else "disabled")
+        self.exr_combo.configure(state="disabled" if is_tif else "readonly")
 
     def browse_outdir(self) -> None:
         folder = filedialog.askdirectory(parent=self.root, title="出力フォルダを選択")
@@ -844,6 +910,7 @@ class App:
         # スレッドに渡す設定値をここで確定させる
         fmt = self.format_map[self.format_var.get()]
         compress = self.comp_map[self.comp_var.get()]
+        exr_compression = self.exr_map[self.exr_var.get()]
         skip_existing = self.skip_var.get()
 
         self.running = True
@@ -860,7 +927,7 @@ class App:
 
         worker = threading.Thread(
             target=self._worker,
-            args=(list(self.files), out_dir_fixed, fmt, compress, skip_existing),
+            args=(list(self.files), out_dir_fixed, fmt, compress, exr_compression, skip_existing),
             daemon=True,
         )
         worker.start()
@@ -871,6 +938,7 @@ class App:
         out_dir_fixed: Path | None,
         fmt: str,
         compress: str,
+        exr_compression: str,
         skip_existing: bool,
     ) -> None:
         done = skipped = failed = 0
@@ -888,6 +956,7 @@ class App:
                     path,
                     fmt=fmt,
                     compress=compress,
+                    exr_compression=exr_compression,
                     out_dir=out_dir,
                     skip_existing=skip_existing,
                     reserved=self.reserved,
