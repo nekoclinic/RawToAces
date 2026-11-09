@@ -70,7 +70,7 @@ python -m PyInstaller --noconfirm --clean RawToAces.spec
 
 - 出力: `dist/RawToAces.exe`（1ファイル・コンソールなし）
 - 同梱物の確認: `dist/RawToAces.exe --selftest`（rawpy / numpy / opencv / tkinter / EXRコーデックを確認し、問題なければ終了コード0）
-- ビルドには `RawToAces.spec` が必要
+- ビルドには `RawToAces.spec` と `icon.ico` が必要
 
 ## 注意
 
