@@ -27,15 +27,17 @@ import cv2
 import numpy as np
 import rawpy
 
-from raw_to_aces import FORMAT_LABELS, OUTPUT_DIR_NAME, RAW_EXTENSIONS, convert_file, describe
+from raw_to_aces import (
+    FORMAT_LABELS, IMAGE_EXTENSIONS, OUTPUT_DIR_NAME, RAW_EXTENSIONS, convert_file, describe,
+)
 
 # 選択肢（キー, 表示名）
 FORMAT_OPTIONS = (("tif", FORMAT_LABELS["tif"]), ("exr", FORMAT_LABELS["exr"]))
-WB_OPTIONS = (("camera", "撮影時 (camera)"), ("auto", "自動 (auto)"), ("none", "なし (none)"))
 COMPRESSION_OPTIONS = (("lzw", "LZW"), ("deflate", "Deflate"), ("none", "圧縮なし"))
 
-# ファイル選択ダイアログ用のパターン
+# ファイル選択ダイアログ用のパターン（raw / raw+通常画像）
 RAW_PATTERN = " ".join(f"*{ext}" for ext in RAW_EXTENSIONS)
+INPUT_PATTERN = " ".join(f"*{ext}" for ext in RAW_EXTENSIONS + IMAGE_EXTENSIONS)
 
 # サムネイルの最大辺(px)と選択枠の色
 THUMB_MAX = 160
@@ -84,14 +86,13 @@ def _decode_thumb(thumb) -> np.ndarray | None:
     return None
 
 
-def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
-    # 埋め込みサムネイルを優先し、使えなければ縮小現像してPNGを作る
+def _raw_thumbnail_bgr(path: Path) -> np.ndarray:
+    # rawの埋め込みサムネイル（無ければ縮小現像）をBGRで返す
     with rawpy.imread(str(path)) as raw:
         flip = raw.sizes.flip
         try:
             img = _decode_thumb(raw.extract_thumb())
         except Exception:
-            # サムネイルが無い/未対応の形式は縮小現像にフォールバック
             img = None
 
         if img is None:
@@ -108,7 +109,26 @@ def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
 
     if img is None:
         raise RuntimeError("プレビューを読み込めません")
-    img = np.ascontiguousarray(_apply_flip(img, flip))
+    return _apply_flip(img, flip)
+
+
+def _image_thumbnail_bgr(path: Path) -> np.ndarray:
+    # raw以外の通常画像（jpg / png / tifなど）を縮小して読む
+    img = cv2.imread(str(path), cv2.IMREAD_REDUCED_COLOR_2)
+    if img is None:
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"画像を読み込めません: {path.name}")
+    return img
+
+
+def make_thumbnail_png(path: Path, max_size: int = THUMB_MAX) -> bytes:
+    # rawは埋め込みサムネイルを優先し、raw以外は画像として読み込む
+    try:
+        img = _raw_thumbnail_bgr(path)
+    except Exception:
+        img = _image_thumbnail_bgr(path)
+    img = np.ascontiguousarray(img)
 
     h, w = img.shape[:2]
     scale = min(max_size / max(w, 1), max_size / max(h, 1), 1.0)
@@ -148,11 +168,9 @@ class App:
         self.thumbs: dict[Path, tk.PhotoImage] = {}
         self.thumb_queue: queue.Queue = queue.Queue()
         self.thumb_pending: set[Path] = set()
-        self.thumb_cols = 0
 
         # 表示名 -> キー の対応表（スレッドからtk変数を読まないよう開始時に確定させる）
         self.format_map = {label: key for key, label in FORMAT_OPTIONS}
-        self.wb_map = {label: key for key, label in WB_OPTIONS}
         self.comp_map = {label: key for key, label in COMPRESSION_OPTIONS}
 
         root.title("raw → ACEScg 変換 (16bit TIFF / 32bit EXR)")
@@ -187,8 +205,6 @@ class App:
 
         self.add_file_btn = ttk.Button(bar, text="ファイル追加", command=self.add_files)
         self.add_file_btn.pack(side="left")
-        self.add_folder_btn = ttk.Button(bar, text="フォルダ追加", command=self.add_folder)
-        self.add_folder_btn.pack(side="left", padx=(6, 0))
         self.remove_btn = ttk.Button(bar, text="選択を削除", command=self.remove_selected)
         self.remove_btn.pack(side="left", padx=(6, 0))
         self.clear_btn = ttk.Button(bar, text="すべてクリア", command=self.clear_all)
@@ -223,13 +239,10 @@ class App:
 
     def _on_grid_resize(self, event) -> None:
         self.grid_canvas.itemconfigure(self.grid_window, width=event.width)
-        self._relayout_tiles(force=True)
+        self._relayout_tiles()
 
-    def _relayout_tiles(self, force: bool = False) -> None:
+    def _relayout_tiles(self) -> None:
         cols = max(1, self.grid_canvas.winfo_width() // (THUMB_MAX + 24))
-        if not force and cols == self.thumb_cols:
-            return
-        self.thumb_cols = cols
         for i, path in enumerate(self.files):
             tile = self.tiles.get(path)
             if tile is not None:
@@ -351,21 +364,13 @@ class App:
         self.format_combo.grid(row=0, column=1, sticky="w", padx=(6, 18))
         self.format_combo.bind("<<ComboboxSelected>>", lambda _e: self._sync_format())
 
-        ttk.Label(box, text="ホワイトバランス").grid(row=0, column=2, sticky="w")
-        self.wb_var = tk.StringVar(value=WB_OPTIONS[0][1])
-        self.wb_combo = ttk.Combobox(
-            box, textvariable=self.wb_var, state="readonly", width=18,
-            values=[label for _, label in WB_OPTIONS],
-        )
-        self.wb_combo.grid(row=0, column=3, sticky="w", padx=(6, 18))
-
-        ttk.Label(box, text="TIFF圧縮").grid(row=0, column=4, sticky="w")
+        ttk.Label(box, text="TIFF圧縮").grid(row=0, column=2, sticky="w")
         self.comp_var = tk.StringVar(value=COMPRESSION_OPTIONS[0][1])
         self.comp_combo = ttk.Combobox(
             box, textvariable=self.comp_var, state="readonly", width=12,
             values=[label for _, label in COMPRESSION_OPTIONS],
         )
-        self.comp_combo.grid(row=0, column=5, sticky="w", padx=(6, 0))
+        self.comp_combo.grid(row=0, column=3, sticky="w", padx=(6, 0))
 
         # 保存先の選択
         self.outmode_var = tk.StringVar(value="same")
@@ -445,23 +450,14 @@ class App:
     def add_files(self) -> None:
         picked = filedialog.askopenfilenames(
             parent=self.root,
-            title="raw画像を選択（複数選択可）",
-            filetypes=[("raw画像", RAW_PATTERN), ("すべてのファイル", "*.*")],
+            title="画像を選択（複数選択可）",
+            filetypes=[
+                ("raw / 画像", INPUT_PATTERN),
+                ("raw画像", RAW_PATTERN),
+                ("すべてのファイル", "*.*"),
+            ],
         )
         self._add_paths([Path(p) for p in picked])
-
-    def add_folder(self) -> None:
-        folder = filedialog.askdirectory(parent=self.root, title="フォルダを選択")
-        if not folder:
-            return
-        found = sorted(
-            p for p in Path(folder).iterdir()
-            if p.is_file() and p.suffix.lower() in RAW_EXTENSIONS
-        )
-        if not found:
-            messagebox.showinfo("フォルダ追加", "raw画像が見つかりませんでした", parent=self.root)
-            return
-        self._add_paths(found)
 
     def _add_paths(self, paths: list[Path]) -> None:
         seen = {p.resolve() for p in self.files}
@@ -564,7 +560,6 @@ class App:
 
         # スレッドに渡す設定値をここで確定させる
         fmt = self.format_map[self.format_var.get()]
-        wb = self.wb_map[self.wb_var.get()]
         compress = self.comp_map[self.comp_var.get()]
         skip_existing = self.skip_var.get()
 
@@ -582,7 +577,7 @@ class App:
 
         worker = threading.Thread(
             target=self._worker,
-            args=(list(self.files), out_dir_fixed, fmt, wb, compress, skip_existing),
+            args=(list(self.files), out_dir_fixed, fmt, compress, skip_existing),
             daemon=True,
         )
         worker.start()
@@ -592,7 +587,6 @@ class App:
         files: list[Path],
         out_dir_fixed: Path | None,
         fmt: str,
-        wb: str,
         compress: str,
         skip_existing: bool,
     ) -> None:
@@ -610,7 +604,6 @@ class App:
                 out_path = convert_file(
                     path,
                     fmt=fmt,
-                    wb=wb,
                     compress=compress,
                     out_dir=out_dir,
                     skip_existing=skip_existing,
@@ -698,12 +691,12 @@ class App:
         state = "disabled" if running else "normal"
         combo_state = "disabled" if running else "readonly"
 
-        for button in (self.add_file_btn, self.add_folder_btn, self.remove_btn, self.clear_btn):
+        for button in (self.add_file_btn, self.remove_btn, self.clear_btn):
             button.configure(state=state)
         self.start_btn.configure(state=state)
         self.cancel_btn.configure(state="normal" if running else "disabled")
         self.skip_check.configure(state=state)
-        for combo in (self.format_combo, self.wb_combo):
+        for combo in (self.format_combo,):
             combo.configure(state=combo_state)
         self.same_radio.configure(state=state)
         self.custom_radio.configure(state=state)

@@ -2,7 +2,9 @@
 
 raw画像を選択して、ACEScg（リニア）へ変換するツール。
 
-出力形式は16bit TIFF / 32bit float EXRから選べます。
+- 入力: raw（DNG / CR3 / NEF など LibRaw対応形式）と通常画像（JPEG / PNG / TIFF / BMP / WebP）
+  - 通常画像は sRGB としてリニア化し、ACEScg へ変換します
+- 出力形式: 16bit TIFF / 32bit float EXR
 
 ## セットアップ
 
@@ -22,6 +24,7 @@ python raw_to_aces.py
 
 ```bash
 python raw_to_aces.py IMG_0001.CR3 IMG_0002.CR3
+python raw_to_aces.py --format exr photo.jpg
 python raw_to_aces.py --format exr IMG_0001.CR3
 ```
 
@@ -30,7 +33,6 @@ python raw_to_aces.py --format exr IMG_0001.CR3
 | オプション | 既定 | 説明 |
 | --- | --- | --- |
 | `--format {tif,exr}` | `tif` | 出力形式（TIFF 16bit / EXR 32bit float） |
-| `--wb {camera,auto,none}` | `camera` | ホワイトバランス（撮影時設定 / 自動 / なし） |
 | `--compress {lzw,deflate,none}` | `lzw` | TIFF圧縮方式（EXRはZIP固定） |
 | `--outdir DIR` | - | 出力先を固定（既定は各画像フォルダ内の `convert_aces/`） |
 | `--skip-existing` | off | 出力済みファイルをスキップ |
@@ -42,6 +44,7 @@ python raw_to_aces.py --format exr IMG_0001.CR3
 - ファイル名: `<元ファイル名>.tif` / `<元ファイル名>.exr`
 - 色: ACEScg（AP1、D60）固定
 - 変換: LibRaw がカメラRGB → XYZ → ACES（D60）へ変換（rawpy の `ColorSpace.ACES`）
+- 通常画像: sRGB（8bit / 16bit）として逆ガンマ → リニアsRGB → ACEScg（D60）へ変換
 - TIFF: 16bit / 3ch / リニア、Photometric=RGB、0..1にクリップ
 - EXR: 32bit float / 3ch / リニア、ZIP圧縮、値はクリップしない
   （AP0→AP1変換で1を超える値や負値はそのまま保持）
@@ -65,18 +68,6 @@ python -m PyInstaller --noconfirm --clean RawToAces.spec
 - 出力: `dist/RawToAces.exe`（1ファイル・コンソールなし）
 - 同梱物の確認: `dist/RawToAces.exe --selftest`（rawpy / numpy / opencv / tkinter / EXRコーデックを確認し、問題なければ終了コード0）
 - ビルドには `RawToAces.spec` が必要
-
-## コミット
-
-コミットメッセージには種類のプレフィックスを付ける（Conventional Commits）。
-
-| プレフィックス | 用途 |
-| --- | --- |
-| `feat:` | 新機能・仕様変更 |
-| `fix:` | 不具合修正 |
-| `docs:` | ドキュメントのみの変更 |
-| `chore:` | ビルド設定・依存関係など |
-| `refactor:` | 挙動を変えない整理 |
 
 ## 注意
 

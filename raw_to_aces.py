@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-# raw画像をACEScgへ変換するCLIツール
+# raw画像と通常画像をACEScgへ変換するCLIツール
 #
 # 使い方:
 #   python raw_to_aces.py                # ファイル選択ダイアログを開く（複数選択可）
 #   python raw_to_aces.py a.CR3 b.NEF    # 引数で指定
-#   python raw_to_aces.py --format exr *.dng
+#   python raw_to_aces.py --format exr *.dng photo.jpg
+#
+# 入力:
+#   raw（LibRawが対応する形式）と通常画像（jpg/png/tifなど、sRGB想定）
 #
 # 出力:
 #   各画像と同じフォルダ内の convert_aces/ に <元ファイル名>.tif / .exr として保存する
@@ -46,6 +49,9 @@ RAW_EXTENSIONS = (
     ".nrw", ".orf", ".pef", ".raf", ".raw", ".rw2", ".rwl", ".srw", ".x3f",
 )
 
+# DNG以外の通常画像の拡張子（sRGBとして扱う）
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")
+
 # 出力フォルダ名（画像と同じフォルダ内に作成する）
 OUTPUT_DIR_NAME = "convert_aces"
 
@@ -63,11 +69,18 @@ AP0_TO_AP1 = np.array([
     [0.0083161484, -0.0060324498, 0.9977163014],
 ], dtype=np.float32)
 
+# リニアsRGB (D65) -> ACEScg (AP1, D60) の変換行列
+SRGB_TO_AP1 = np.array([
+    [0.6131949072, 0.3395153310, 0.0473681035],
+    [0.0702049991, 0.9163327640, 0.0134491708],
+    [0.0206188777, 0.1095672178, 0.8696059478],
+], dtype=np.float32)
+
 # OpenCVのTIFF圧縮指定値
 COMPRESSION = {"lzw": 5, "deflate": 8, "none": 1}
 
 
-def decode_to_acescg(path: Path, wb: str) -> np.ndarray:
+def _decode_raw_to_acescg(path: Path) -> np.ndarray:
     # rawpy(LibRaw)で現像し、カメラRGB -> XYZ -> ACES(AP0) のリニア16bitを得る
     with rawpy.imread(str(path)) as raw:
         rgb = raw.postprocess(
@@ -75,8 +88,7 @@ def decode_to_acescg(path: Path, wb: str) -> np.ndarray:
             gamma=(1, 1),          # リニア（ガンマなし）
             output_bps=16,
             no_auto_bright=True,   # 自動明るさ補正はかけない
-            use_camera_wb=(wb == "camera"),
-            use_auto_wb=(wb == "auto"),
+            use_camera_wb=True,    # 撮影時のホワイトバランス
         )
 
     # 0..1のリニア値に正規化
@@ -84,6 +96,46 @@ def decode_to_acescg(path: Path, wb: str) -> np.ndarray:
 
     # ACES2065-1 (AP0) -> ACEScg (AP1)
     return arr @ AP0_TO_AP1.T
+
+
+def _decode_image_to_acescg(path: Path) -> np.ndarray:
+    # DNG以外の通常画像（sRGB想定）をリニアACEScgへ変換する
+    if cv2 is None:
+        raise RuntimeError("OpenCV (opencv-python) が必要です: pip install opencv-python")
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"画像を読み込めません: {path.name}")
+
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    if img.dtype == np.uint8:
+        arr = img.astype(np.float32) / 255.0
+    elif img.dtype == np.uint16:
+        arr = img.astype(np.float32) / 65535.0
+    else:
+        raise RuntimeError("未対応の画像形式です（8bit / 16bit画像に対応）")
+
+    # sRGBの逆ガンマでリニアに戻す
+    linear = np.where(
+        arr <= 0.04045, arr / 12.92, ((arr + 0.055) / 1.055) ** 2.4,
+    )
+
+    # リニアsRGB (BGR -> RGB) -> ACEScg
+    return np.ascontiguousarray(linear[:, :, ::-1] @ SRGB_TO_AP1.T, dtype=np.float32)
+
+
+def decode_to_acescg(path: Path) -> np.ndarray:
+    # rawとして読めなければ通常画像として読む
+    try:
+        return _decode_raw_to_acescg(path)
+    except Exception as raw_exc:
+        try:
+            return _decode_image_to_acescg(path)
+        except Exception:
+            raise raw_exc
 
 
 def write_tiff16(rgb: np.ndarray, path: Path, compression: str) -> None:
@@ -122,7 +174,6 @@ def describe(exc: Exception) -> str:
 def convert_file(
     path: Path,
     fmt: str = "tif",
-    wb: str = "camera",
     compress: str = "lzw",
     out_dir: Path | None = None,
     skip_existing: bool = False,
@@ -136,6 +187,9 @@ def convert_file(
 
     ext = FORMAT_EXTENSIONS[fmt]
     out_path = out_dir / f"{path.stem}{ext}"
+    # 入力と同名になる場合（例: tif -> tif で同じフォルダ）は上書きしない
+    if out_path.resolve() == path.resolve():
+        out_path = out_dir / f"{path.stem}_aces{ext}"
     if out_path.exists() and skip_existing:
         raise FileExistsError(out_path)
 
@@ -145,7 +199,7 @@ def convert_file(
         out_path = out_dir / f"{path.stem}_{i}{ext}"
         i += 1
 
-    rgb = decode_to_acescg(path, wb)
+    rgb = decode_to_acescg(path)
     if fmt == "exr":
         write_exr32(rgb, out_path)
     else:
@@ -190,14 +244,13 @@ def notify(title: str, message: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="raw画像をリニアACEScgへ変換し、同じフォルダの "
+        description="raw画像や通常画像をリニアACEScgへ変換し、同じフォルダの "
                     f"{OUTPUT_DIR_NAME}/ に 16bit TIFF / 32bit EXR として保存します。",
     )
-    parser.add_argument("files", nargs="*", type=Path, help="raw画像（省略時はダイアログで選択）")
+    parser.add_argument("files", nargs="*", type=Path,
+                        help="画像（raw / jpg / png / tif など。省略時はダイアログで選択）")
     parser.add_argument("--format", choices=sorted(FORMAT_LABELS), default="tif",
                         help="出力形式 (既定: tif = 16bit TIFF)")
-    parser.add_argument("--wb", choices=["camera", "auto", "none"], default="camera",
-                        help="ホワイトバランス (既定: camera = 撮影時設定)")
     parser.add_argument("--compress", choices=sorted(COMPRESSION), default="lzw",
                         help="TIFF圧縮 (既定: lzw)")
     parser.add_argument("--outdir", type=Path, default=None,
@@ -241,7 +294,6 @@ def main(argv: list[str] | None = None) -> int:
             out_path = convert_file(
                 path,
                 fmt=args.format,
-                wb=args.wb,
                 compress=args.compress,
                 out_dir=args.outdir,
                 skip_existing=args.skip_existing,
