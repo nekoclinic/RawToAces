@@ -86,30 +86,116 @@ def _decode_thumb(thumb) -> np.ndarray | None:
     return None
 
 
+def _srgb_encode(x: np.ndarray) -> np.ndarray:
+    return np.where(x <= 0.0031308, x * 12.92, 1.055 * np.power(x, 1.0 / 2.4) - 0.055)
+
+
+def _postprocess_bgr(raw: "rawpy.RawPy") -> np.ndarray | None:
+    # 現像できればBGR画像を返す（高速設定→既定設定の順で試す）
+    attempts = (
+        {"half_size": True, "demosaic_algorithm": rawpy.DemosaicAlgorithm.LINEAR},
+        {"half_size": True},
+        {},  # half_size非対応の形式（Foveonなど）向け
+    )
+    for extra in attempts:
+        try:
+            rgb = raw.postprocess(
+                use_camera_wb=True,
+                no_auto_bright=True,
+                output_bps=8,
+                **extra,
+            )
+        except Exception:
+            continue
+        return np.ascontiguousarray(rgb[:, :, ::-1])
+    return None
+
+
+def _bayer_preview_bgr(raw: "rawpy.RawPy", max_size: int = 512) -> np.ndarray | None:
+    # 現像もサムネイルも使えない場合の最終手段
+    # ベイヤー配列を2x2で平均して簡易プレビューを作る（デモザイクなし）
+    try:
+        data = raw.raw_image_visible
+        colors = raw.raw_colors_visible
+    except Exception:
+        try:
+            raw.unpack()
+            data = raw.raw_image_visible
+            colors = raw.raw_colors_visible
+        except Exception:
+            return None
+    if data is None or getattr(data, "ndim", 0) != 2:
+        return None
+
+    h, w = data.shape
+    h2, w2 = h // 2, w // 2
+    if h2 < 2 or w2 < 2:
+        return None
+
+    planes: dict[int, list[np.ndarray]] = {}
+    for dy in (0, 1):
+        for dx in (0, 1):
+            cid = int(colors[dy, dx]) if colors is not None else dy * 2 + dx
+            planes.setdefault(cid, []).append(data[dy::2, dx::2])
+
+    try:
+        wb = [float(v) for v in raw.camera_whitebalance[:4]]
+    except Exception:
+        wb = [1.0, 1.0, 1.0, 1.0]
+    try:
+        white = float(raw.white_level)
+    except Exception:
+        white = 65535.0
+    if white <= 0:
+        white = 65535.0
+
+    scale = min(max_size / max(w2, 1), max_size / max(h2, 1), 1.0)
+    tw = max(1, int(w2 * scale))
+    th = max(1, int(h2 * scale))
+
+    chans: dict[str, np.ndarray] = {}
+    for name, ids, mult in (
+        ("r", (0,), wb[0]),
+        ("g", (1, 3), (wb[1] + wb[3]) / 2.0),
+        ("b", (2,), wb[2]),
+    ):
+        ps = [p for i in ids for p in planes.get(i, [])]
+        if not ps:
+            return None
+        acc = ps[0].astype(np.float32)
+        for p in ps[1:]:
+            acc += p
+        acc /= len(ps) * white
+        acc *= mult
+        np.clip(acc, 0.0, 1.0, out=acc)
+        small = cv2.resize(acc, (tw, th), interpolation=cv2.INTER_AREA)
+        chans[name] = _srgb_encode(small)
+
+    bgr = np.stack([chans["b"], chans["g"], chans["r"]], axis=-1)
+    return np.ascontiguousarray(np.rint(bgr * 255.0).astype(np.uint8))
+
+
 def _raw_thumbnail_bgr(path: Path) -> np.ndarray:
-    # rawの埋め込みサムネイル（無ければ縮小現像）をBGRで返す
+    # rawのサムネイルをBGRで返す（埋め込み→縮小現像→ベイヤー簡易表示の順）
     with rawpy.imread(str(path)) as raw:
         flip = raw.sizes.flip
         try:
             img = _decode_thumb(raw.extract_thumb())
+            need_flip = True
         except Exception:
             img = None
+            need_flip = True
 
         if img is None:
-            # サムネイルが使えない場合の最低限の現像（高速設定）
-            rgb = raw.postprocess(
-                half_size=True,
-                demosaic_algorithm=rawpy.DemosaicAlgorithm.LINEAR,
-                use_camera_wb=True,
-                no_auto_bright=True,
-                output_bps=8,
-            )
-            img = np.ascontiguousarray(rgb[:, :, ::-1])
-            flip = 0  # 現像側で向きが反映されるため再適用しない
+            img = _postprocess_bgr(raw)
+            need_flip = False  # 現像側で向きが反映される
+        if img is None:
+            img = _bayer_preview_bgr(raw)
+            need_flip = True
 
     if img is None:
-        raise RuntimeError("プレビューを読み込めません")
-    return _apply_flip(img, flip)
+        raise RuntimeError("rawを読み込めませんでした")
+    return _apply_flip(img, flip) if need_flip else img
 
 
 def _image_thumbnail_bgr(path: Path) -> np.ndarray:
