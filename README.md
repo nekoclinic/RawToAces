@@ -30,7 +30,7 @@ python raw_to_aces_gui.py
 
 | 項目 | 内容 |
 | --- | --- |
-| 出力形式 | `TIFF (16bit)` / `OpenEXR (32bit float)` |
+| 出力形式 | `OpenEXR (32bit float)`（既定） / `TIFF (16bit)` |
 | TIFF圧縮 | LZW / Deflate / 圧縮なし（EXRはZIP固定） |
 | 保存先 | 各画像のフォルダ内の `convert_aces/`、または指定フォルダ |
 | 出力済みファイルはスキップ | 同名ファイルがある場合にスキップ（オフなら連番で保存） |
@@ -46,6 +46,16 @@ python raw_to_aces_gui.py
 - TIFF: 16bit / 3ch / リニア、Photometric=RGB、0..1にクリップ
 - EXR: 32bit float / 3ch / リニア、ZIP圧縮、値はクリップしない
   （AP0→AP1変換で1を超える値や負値はそのまま保持）
+  ACEScg（AP1）の chromaticities を埋め込むため、ACES OCIO設定のBlender等では
+  ACEScgとして読み込まれます
+
+## Blenderで読み込む
+
+- **EXR（推奨）**: そのまま読み込めます。既定のBlender設定ではカラースペースが
+  `Linear Rec.709` になるため、ACESで運用する場合は ACES OCIO 設定を入れて
+  `ACEScg` を選んでください。
+- **TIFF**: 16bitリニアのため、Blenderの既定（sRGBとして解釈）では暗く見えます。
+  画像のカラースペースを `Non-Color` または `ACEScg` に変更してください。
 
 ## exeのビルド（Windows）
 

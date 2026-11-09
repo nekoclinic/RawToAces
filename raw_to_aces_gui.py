@@ -27,6 +27,12 @@ import cv2
 import numpy as np
 import rawpy
 
+# EXRにACEScg (AP1) の色域情報を付けるために使う（無ければOpenCVで保存）
+try:
+    import OpenEXR
+except ImportError:
+    OpenEXR = None
+
 # 対応するrawの拡張子（ファイル選択ダイアログのフィルタにも使用）
 RAW_EXTENSIONS = (
     ".3fr", ".ari", ".arw", ".bay", ".cr2", ".cr3", ".crw", ".dcr", ".dng",
@@ -63,6 +69,11 @@ SRGB_TO_AP1 = np.array([
 
 # OpenCVのTIFF圧縮指定値
 COMPRESSION = {"lzw": 5, "deflate": 8, "none": 1}
+
+# ACEScg (AP1) のchromaticities（red, green, blue, white）
+AP1_CHROMATICITIES = (
+    0.713, 0.293, 0.165, 0.830, 0.128, 0.044, 0.32168, 0.33767,
+)
 
 # 選択肢（キー, 表示名）
 FORMAT_OPTIONS = (("tif", FORMAT_LABELS["tif"]), ("exr", FORMAT_LABELS["exr"]))
@@ -148,11 +159,25 @@ def write_tiff16(rgb: np.ndarray, path: Path, compression: str) -> None:
 
 def write_exr32(rgb: np.ndarray, path: Path) -> None:
     # 32bit float RGB EXRとして保存する（ZIP圧縮、値はクリップしない）
+    data = np.ascontiguousarray(rgb, dtype=np.float32)
+    if OpenEXR is not None:
+        # R,G,Bの名前付きチャンネル + ACEScgのchromaticitiesで保存する
+        channels = {
+            name: OpenEXR.Channel(np.ascontiguousarray(data[:, :, i]))
+            for i, name in enumerate("RGB")
+        }
+        header = {
+            "compression": OpenEXR.ZIP_COMPRESSION,
+            "chromaticities": AP1_CHROMATICITIES,
+        }
+        OpenEXR.File(header, channels).write(str(path))
+        return
+
     params = [
         cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT,
         cv2.IMWRITE_EXR_COMPRESSION, cv2.IMWRITE_EXR_COMPRESSION_ZIP,
     ]
-    out = np.ascontiguousarray(rgb[:, :, ::-1], dtype=np.float32)
+    out = np.ascontiguousarray(data[:, :, ::-1])
     if not cv2.imwrite(str(path), out, params):
         raise RuntimeError(f"EXRの書き込みに失敗しました: {path}")
 
@@ -449,6 +474,7 @@ class App:
         self._build_actions(main)
 
         self._sync_outmode()
+        self._sync_format()
         for _ in range(2):
             threading.Thread(target=self._thumb_worker, daemon=True).start()
         self.root.bind_all("<MouseWheel>", self._on_wheel)
@@ -613,7 +639,7 @@ class App:
         box.columnconfigure(3, weight=1)
 
         ttk.Label(box, text="出力形式").grid(row=0, column=0, sticky="w")
-        self.format_var = tk.StringVar(value=FORMAT_OPTIONS[0][1])
+        self.format_var = tk.StringVar(value=FORMAT_LABELS["exr"])
         self.format_combo = ttk.Combobox(
             box, textvariable=self.format_var, state="readonly", width=18,
             values=[label for _, label in FORMAT_OPTIONS],
@@ -782,7 +808,7 @@ class App:
 
     def _sync_format(self) -> None:
         # 圧縮設定はTIFFのときだけ有効にする
-        enabled = self.format_var.get() == FORMAT_OPTIONS[0][1] and not self.running
+        enabled = self.format_var.get() == FORMAT_LABELS["tif"] and not self.running
         self.comp_combo.configure(state="readonly" if enabled else "disabled")
 
     def browse_outdir(self) -> None:
@@ -1007,6 +1033,10 @@ def main() -> int:
         probe = tk.Tk()
         probe.withdraw()
         probe.destroy()
+
+        # EXRのchromaticities付与に使うOpenEXRが使えるか確認する
+        if OpenEXR is None:
+            return 4
 
         # EXRコーデック（32bit float）が動くか書き出し→読み込みで確認する
         with tempfile.TemporaryDirectory() as tmp:
