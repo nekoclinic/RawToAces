@@ -72,9 +72,9 @@ COMPRESSION = {"lzw": 5, "deflate": 8, "none": 1}
 
 # EXR圧縮（キー -> OpenEXR / OpenCVの値）
 EXR_COMPRESSION_OPTIONS = (
+    ("zip", "ZIP (可逆)"),
     ("pxr24", "PXR24 (軽量)"),
     ("dwaa", "DWAA (最小・非可逆)"),
-    ("zip", "ZIP (可逆)"),
 )
 
 # ACEScg (AP1) のchromaticities（red, green, blue, white）
@@ -203,7 +203,7 @@ def write_tiff16(rgb: np.ndarray, path: Path, compression: str) -> None:
         raise RuntimeError(f"TIFFの書き込みに失敗しました: {path}")
 
 
-def write_exr32(rgb: np.ndarray, path: Path, compression: str = "pxr24") -> None:
+def write_exr32(rgb: np.ndarray, path: Path, compression: str = "zip") -> None:
     # 32bit float RGB EXRとして保存する（値はクリップしない）
     data = np.ascontiguousarray(rgb, dtype=np.float32)
     if OpenEXR is not None:
@@ -211,7 +211,7 @@ def write_exr32(rgb: np.ndarray, path: Path, compression: str = "pxr24") -> None
             "zip": OpenEXR.ZIP_COMPRESSION,
             "pxr24": OpenEXR.PXR24_COMPRESSION,
             "dwaa": OpenEXR.DWAA_COMPRESSION,
-        }.get(compression, OpenEXR.PXR24_COMPRESSION)
+        }.get(compression, OpenEXR.ZIP_COMPRESSION)
         # R,G,Bの名前付きチャンネル + ACEScgのchromaticitiesで保存する
         channels = {
             name: OpenEXR.Channel(np.ascontiguousarray(data[:, :, i]))
@@ -228,7 +228,7 @@ def write_exr32(rgb: np.ndarray, path: Path, compression: str = "pxr24") -> None
         "zip": cv2.IMWRITE_EXR_COMPRESSION_ZIP,
         "pxr24": cv2.IMWRITE_EXR_COMPRESSION_PXR24,
         "dwaa": cv2.IMWRITE_EXR_COMPRESSION_DWAA,
-    }.get(compression, cv2.IMWRITE_EXR_COMPRESSION_PXR24)
+    }.get(compression, cv2.IMWRITE_EXR_COMPRESSION_ZIP)
     params = [
         cv2.IMWRITE_EXR_TYPE, cv2.IMWRITE_EXR_TYPE_FLOAT,
         cv2.IMWRITE_EXR_COMPRESSION, comp_cv,
@@ -242,7 +242,7 @@ def convert_file(
     path: Path,
     fmt: str = "tif",
     compress: str = "lzw",
-    exr_compression: str = "pxr24",
+    exr_compression: str = "zip",
     out_dir: Path | None = None,
     skip_existing: bool = False,
     reserved: set[Path] | None = None,
