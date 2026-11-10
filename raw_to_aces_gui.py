@@ -7,7 +7,7 @@
 # 「ファイル追加」で画像を選び、「変換開始」でリニアACEScgへ変換する
 # 追加した画像はサムネイルのグリッドで一覧表示される（クリックで選択）
 # 出力形式は16bit TIFF / 32bit float EXRから選べる
-# 保存先は既定で各画像フォルダ内の convert_aces/、設定で固定フォルダも選べる
+# 保存先は既定で各画像フォルダ内の converted_aces/、設定で固定フォルダも選べる
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ RAW_EXTENSIONS = (
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")
 
 # 出力フォルダ名（画像と同じフォルダ内に作成する）
-OUTPUT_DIR_NAME = "convert_aces"
+OUTPUT_DIR_NAME = "converted_aces"
 
 # 出力形式の表示名と拡張子
 FORMAT_LABELS = {

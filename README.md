@@ -20,7 +20,7 @@ python raw_to_aces_gui.py
 
 ## 出力
 
-- 保存先: 各画像フォルダ内の `convert_aces/`（指定フォルダも可）
+- 保存先: 各画像フォルダ内の `converted_aces/`（指定フォルダも可）
 - ファイル名: `<元ファイル名>.tif` / `.exr`（同名があれば `-1`, `-2` …）
 - 色: ACEScg（AP1、D60）固定
 

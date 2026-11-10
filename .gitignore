@@ -224,6 +224,7 @@ __marimo__/
 !RawToAces.spec
 
 # 変換結果の出力フォルダ
+converted_aces/
 convert_aces/
 
 # 動作確認用の一時フォルダ・ログ
